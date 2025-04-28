@@ -1,0 +1,43 @@
+# 数据集文件
+data/
+datasets/raw/
+
+# 模型文件
+models/
+*.model
+*.bin
+*.pkl
+*.pt
+*.pth
+
+# 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# 环境文件
+venv/
+env/
+.env
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+
+# 日志和检查点
+logs/
+checkpoints/
+runs/
+*.log
+
+# 临时文件
+temp/
+tmp/
+
+# 大文件
+*.zip
+*.tar.gz
+*.npy
+*.npz
