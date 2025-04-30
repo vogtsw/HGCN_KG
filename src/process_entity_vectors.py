@@ -1,16 +1,18 @@
 import os
 import sys
-import torch
 import json
+import torch
+import numpy as np
 from tqdm import tqdm
 from typing import List, Dict, Optional
+from transformers import BertTokenizer, BertForTokenClassification
+from wikipedia2vec import Wikipedia2Vec
 
 # 添加项目根目录到Python路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
 sys.path.append(root_dir)
 
-from pytorch_pretrained_bert import BertTokenizer, BertForTokenClassification
 from utils.entity_vector_processor import EntityVectorProcessor
 from args import get_args
 
@@ -122,58 +124,94 @@ def is_valid_entity(text: str, type: str) -> bool:
     
     return True
 
-def post_process_entity(entity: Dict) -> Optional[Dict]:
-    """对实体进行后处理
+def combine_subword_tokens(tokens: List[str], predictions: np.ndarray, probabilities: np.ndarray, threshold: float = 0.3) -> List[Dict]:
+    """合并子词标记并提取实体
     
     Args:
-        entity: 实体字典
+        tokens: 分词后的标记列表
+        predictions: 每个标记的预测标签
+        probabilities: 每个标记的预测概率
+        threshold: 预测概率阈值
         
     Returns:
-        processed_entity: 处理后的实体字典，如果实体无效则返回None
+        entities: 实体列表
     """
-    # 特殊缩写和术语的映射
-    term_mapping = {
-        "mr scan": "MRI scan",
-        "mri scan": "MRI scan",
-        "ct scan": "CT scan",
-        "ai": "AI",
-        "ml": "ML",
-        "dl": "DL",
-        "nlp": "NLP",
-        "cv": "CV",
-        "quantum comp": "quantum computing",
-        "deep learn": "deep learning",
-        "machine learn": "machine learning",
-        "neural net": "neural network",
-        "artificial intel": "artificial intelligence"
-    }
+    entities = []
+    current_entity = None
+    current_text = []
+    prev_was_entity = False
     
-    # 统一大小写
-    text = entity["text"]
+    # 跳过[CLS]和[SEP]标记
+    for i, (token, pred, prob) in enumerate(zip(tokens[1:-1], predictions[1:-1], probabilities[1:-1])):
+        # 如果是子词标记（以##开头）
+        is_subword = token.startswith("##")
+        clean_token = token[2:] if is_subword else token
+        
+        # 只有当预测概率大于阈值时才考虑这个标记
+        if prob > threshold:
+            if pred == 1:  # B-tag
+                # 保存之前的实体
+                if current_entity and len(current_text) > 0:
+                    current_entity["text"] = " ".join("".join(current_text).split())
+                    if len(current_entity["text"]) > 1 and not current_entity["text"].lower() in [".", ",", "'", ":", ";", "-", "and", "or", "the", "a", "an"]:
+                        entities.append(current_entity)
+                # 开始新实体
+                current_text = [clean_token]
+                current_entity = {"text": "", "type": "ENTITY", "start": i, "end": i}
+                prev_was_entity = True
+            elif pred == 2:  # I-tag
+                if prev_was_entity:
+                    # 继续当前实体
+                    if is_subword:
+                        current_text.append(clean_token)
+                    else:
+                        current_text.append(" " + clean_token)
+                    if current_entity:
+                        current_entity["end"] = i
+                else:
+                    # 如果前一个不是实体，将其视为B-tag开始新实体
+                    if current_entity and len(current_text) > 0:
+                        current_entity["text"] = " ".join("".join(current_text).split())
+                        if len(current_entity["text"]) > 1 and not current_entity["text"].lower() in [".", ",", "'", ":", ";", "-", "and", "or", "the", "a", "an"]:
+                            entities.append(current_entity)
+                    current_text = [clean_token]
+                    current_entity = {"text": "", "type": "ENTITY", "start": i, "end": i}
+                    prev_was_entity = True
+            else:  # O-tag
+                if current_entity and len(current_text) > 0:
+                    current_entity["text"] = " ".join("".join(current_text).split())
+                    if len(current_entity["text"]) > 1 and not current_entity["text"].lower() in [".", ",", "'", ":", ";", "-", "and", "or", "the", "a", "an"]:
+                        entities.append(current_entity)
+                current_entity = None
+                current_text = []
+                prev_was_entity = False
+        else:
+            if current_entity and len(current_text) > 0:
+                current_entity["text"] = " ".join("".join(current_text).split())
+                if len(current_entity["text"]) > 1 and not current_entity["text"].lower() in [".", ",", "'", ":", ";", "-", "and", "or", "the", "a", "an"]:
+                    entities.append(current_entity)
+            current_entity = None
+            current_text = []
+            prev_was_entity = False
     
-    # 检查是否需要替换为标准术语
-    lower_text = text.lower()
-    for term, replacement in term_mapping.items():
-        if lower_text == term or lower_text.startswith(term + " ") or lower_text.endswith(" " + term):
-            text = replacement
-            break
+    # 处理最后一个实体
+    if current_entity and len(current_text) > 0:
+        current_entity["text"] = " ".join("".join(current_text).split())
+        if len(current_entity["text"]) > 1 and not current_entity["text"].lower() in [".", ",", "'", ":", ";", "-", "and", "or", "the", "a", "an"]:
+            entities.append(current_entity)
     
-    # 如果是技术术语（MISC类型），统一使用标准形式
-    if entity["type"] == "MISC":
-        # 对于缩写词，保持大写
-        if len(text) <= 4 and text.isupper():
-            pass
-        # 对于普通术语，只保持首字母大写
-        elif text[0].isupper():
-            text = text[0] + text[1:].lower()
+    # 清理实体文本
+    cleaned_entities = []
+    for entity in entities:
+        # 清理文本
+        text = entity["text"].strip()
+        # 移除特殊字符
+        text = text.replace("#", "").strip()
+        if text and len(text) > 1:
+            entity["text"] = text
+            cleaned_entities.append(entity)
     
-    # 更新实体文本
-    entity["text"] = text
-    
-    # 验证处理后的实体是否有效
-    if is_valid_entity(text, entity["type"]):
-        return entity
-    return None
+    return cleaned_entities
 
 def extract_entities_from_text(text: str, 
                              model: BertForTokenClassification,
@@ -190,111 +228,179 @@ def extract_entities_from_text(text: str,
     Returns:
         entities: 实体列表
     """
-    # 将文本转换为模型输入格式
-    tokens = tokenizer.tokenize(text)
-    if len(tokens) > args.max_seq_length - 2:
-        tokens = tokens[:(args.max_seq_length - 2)]
+    try:
+        # 分词
+        tokens = tokenizer.tokenize(text)
+        
+        # 如果文本太长，进行截断
+        if len(tokens) > args.max_seq_length - 2:  # 考虑[CLS]和[SEP]
+            tokens = tokens[:(args.max_seq_length - 2)]
+        
+        # 添加特殊标记
+        tokens = ["[CLS]"] + tokens + ["[SEP]"]
+        input_ids = tokenizer.convert_tokens_to_ids(tokens)
+        
+        # 创建attention mask
+        attention_mask = [1] * len(input_ids)
+        
+        # Padding
+        padding = [0] * (args.max_seq_length - len(input_ids))
+        input_ids += padding
+        attention_mask += padding
+        
+        # 转换为tensor
+        input_ids = torch.tensor([input_ids], dtype=torch.long).to(args.device)
+        attention_mask = torch.tensor([attention_mask], dtype=torch.long).to(args.device)
+        
+        # 获取模型输出
+        with torch.no_grad():
+            outputs = model(input_ids, attention_mask=attention_mask)
+            logits = outputs.logits  # [batch_size, sequence_length, num_labels]
+        
+        # 获取预测结果
+        probabilities = torch.softmax(logits, dim=-1)  # [batch_size, sequence_length, num_labels]
+        predictions = torch.argmax(probabilities, dim=-1)  # [batch_size, sequence_length]
+        predictions = predictions[0].detach().cpu().numpy()  # [sequence_length]
+        max_probs = torch.max(probabilities[0], dim=-1)[0].detach().cpu().numpy()  # [sequence_length]
+        
+        # 打印调试信息
+        print(f"\nProcessing text: {text[:100]}...")  # 只显示前100个字符
+        print(f"Number of tokens: {len(tokens)}")
+        print(f"Input IDs shape: {input_ids.shape}")
+        print(f"Attention mask shape: {attention_mask.shape}")
+        print(f"Logits shape: {logits.shape}")
+        print(f"Probabilities shape: {probabilities.shape}")
+        print(f"Predictions shape: {predictions.shape}")
+        
+        # 确保predictions的长度与tokens的长度匹配
+        token_predictions = predictions[:len(tokens)]
+        token_probabilities = max_probs[:len(tokens)]
+        
+        # 如果predictions是标量，将其转换为长度为1的数组
+        if np.isscalar(token_predictions):
+            token_predictions = np.array([0] * len(tokens))  # 默认所有token都是O标签
+            token_probabilities = np.array([1.0] * len(tokens))
+        
+        # 打印每个token和对应的预测标签
+        print("\nToken predictions:")
+        for token, pred, prob in list(zip(tokens, token_predictions, token_probabilities))[:10]:  # 只显示前10个token的预测
+            print(f"{token}: {pred} (prob={prob:.4f})")
+        
+        # 合并子词标记并提取实体
+        entities = combine_subword_tokens(tokens, token_predictions, token_probabilities)
+        
+        # 打印识别出的实体
+        print(f"Found {len(entities)} entities: {entities[:3]}...")  # 只显示前3个实体
+        
+        return entities
+        
+    except Exception as e:
+        print(f"Error processing text: {str(e)}")
+        print(f"Text length: {len(text)}")
+        print(f"Text preview: {text[:100]}...")
+        return []
+
+def load_json_data(file_path, max_samples=None):
+    """加载JSON数据，处理可能的二进制前缀
     
-    tokens = ["[CLS]"] + tokens + ["[SEP]"]
-    input_ids = tokenizer.convert_tokens_to_ids(tokens)
-    attention_mask = [1] * len(input_ids)
-    token_type_ids = [0] * len(input_ids)
+    Args:
+        file_path: JSON文件路径
+        max_samples: 最大样本数，如果为None则加载所有样本
+        
+    Returns:
+        data: JSON数据列表
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+        start_idx = content.find('{')
+        content = content[start_idx:]
+        
+        # 尝试加载JSON数据
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict):
+                data = [data]
+        except json.JSONDecodeError:
+            # 如果是多个JSON对象，尝试逐行解析
+            lines = content.strip().split('\n')
+            data = []
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                    data.append(item)
+                except json.JSONDecodeError:
+                    continue
     
-    # Padding
-    padding = [0] * (args.max_seq_length - len(input_ids))
-    input_ids += padding
-    attention_mask += padding
-    token_type_ids += padding
+    # 如果指定了最大样本数，只返回前max_samples个样本
+    if max_samples is not None:
+        data = data[:max_samples]
     
-    # 转换为tensor
-    input_ids = torch.tensor([input_ids], dtype=torch.long).to(args.device)
-    attention_mask = torch.tensor([attention_mask], dtype=torch.long).to(args.device)
-    token_type_ids = torch.tensor([token_type_ids], dtype=torch.long).to(args.device)
-    
-    # 预测
-    model.eval()
-    with torch.no_grad():
-        logits = model(input_ids, token_type_ids, attention_mask)
-        predictions = torch.argmax(logits, dim=2)[0].cpu().numpy()
-    
-    # 解码预测结果
-    label_list = ["O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"]
-    predicted_labels = [label_list[p] for p in predictions[:len(tokens)]]
-    
-    # 提取实体
-    entities = []
-    current_entity = None
-    
-    for token, label in zip(tokens[1:-1], predicted_labels[1:-1]):  # 跳过[CLS]和[SEP]
-        if label.startswith("B-"):
-            if current_entity:
-                processed_entity = post_process_entity(current_entity)
-                if processed_entity:
-                    entities.append(processed_entity)
-            current_entity = {"type": label[2:], "text": token.replace("##", "")}
-        elif label.startswith("I-") and current_entity and label[2:] == current_entity["type"]:
-            if not token.startswith("##"):
-                current_entity["text"] += " "
-            current_entity["text"] += token.replace("##", "")
-        else:
-            if current_entity:
-                processed_entity = post_process_entity(current_entity)
-                if processed_entity:
-                    entities.append(processed_entity)
-                current_entity = None
-    
-    if current_entity:
-        processed_entity = post_process_entity(current_entity)
-        if processed_entity:
-            entities.append(processed_entity)
-    
-    return entities
+    return data
 
 def main():
+    # 解析参数
     args = get_args()
     
-    # 初始化BERT模型和分词器
-    print("Initializing BERT model...")
-    tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+    # 设置设备
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.device = device
     
-    model = BertForTokenClassification.from_pretrained('bert-base-cased', num_labels=9)
+    # 加载BERT模型
+    print("Loading BERT model...")
+    model_name = 'bert-base-cased'  # 使用预训练的cased模型
+    tokenizer = BertTokenizer.from_pretrained(model_name)
+    model = BertForTokenClassification.from_pretrained(model_name, num_labels=args.num_labels)
     model.to(device)
     
-    # 加载文档
-    print("Loading documents...")
-    with open(os.path.join(args.data_dir, "text.txt"), "r", encoding="utf-8") as f:
-        documents = [line.strip() for line in f]
+    # 加载Wikipedia2Vec模型
+    print("Loading Wikipedia2Vec model...")
+    wiki2vec = Wikipedia2Vec.load(args.wiki2vec_model_path)
     
-    # 提取实体
-    print("Extracting entities...")
+    # 加载训练数据
+    train_file = os.path.join(args.data_dir, "exAAPD_train.json")
+    train_data = load_json_data(train_file)
+    
+    # 创建输出目录
+    output_dir = os.path.join(args.data_dir, "processed")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 处理每个文档
     all_entities = []
-    for doc in tqdm(documents):
-        entities = extract_entities_from_text(doc, model, tokenizer, args)
-        all_entities.append(entities)
+    all_vectors = []
     
-    # 保存提取的实体
-    with open(os.path.join(args.data_dir, "extracted_entities.json"), "w", encoding="utf-8") as f:
-        json.dump(all_entities, f, ensure_ascii=False, indent=2)
+    for doc in tqdm(train_data, desc="Processing documents"):
+        # 获取文本
+        text = doc.get("text", "") or doc.get("title", "")
+        if not isinstance(text, str) or not text.strip():
+            continue
+            
+        # 提取实体
+        entities = extract_entities_from_text(text, model, tokenizer, args)
+        if not entities:
+            continue
+            
+        # 获取实体向量
+        doc_vectors = []
+        for entity in entities:
+            try:
+                vector = wiki2vec.get_entity_vector(entity["text"])
+                if vector is not None:
+                    doc_vectors.append(vector)
+            except (KeyError, ValueError) as e:
+                continue
+        
+        if doc_vectors:
+            all_entities.append(entities)
+            all_vectors.append(doc_vectors)
     
-    # 初始化实体向量处理器
-    print("Getting entity vectors...")
-    entity_processor = EntityVectorProcessor(args.wiki2vec_model_path)
+    # 保存结果
+    print("Saving vectors...")
+    with open(os.path.join(output_dir, "train_entities.json"), "w", encoding="utf-8") as f:
+        json.dump(all_entities, f, indent=2, ensure_ascii=False)
     
-    # 获取实体向量
-    document_vectors = entity_processor.get_document_entity_vectors(all_entities)
+    np.save(os.path.join(output_dir, "train_entity_vectors.npy"), np.array(all_vectors, dtype=object))
     
-    # 保存实体向量
-    entity_processor.save_vectors(
-        {f"doc_{i}": vectors for i, vectors in enumerate(document_vectors)},
-        os.path.join(args.data_dir, "entity_vectors.npy")
-    )
+    print(f"Done! Processed {len(all_entities)} documents, extracted {sum(len(doc_entities) for doc_entities in all_entities)} entities")
     
-    total_entities = sum(len(doc_entities) for doc_entities in all_entities)
-    print(f"Processed {len(documents)} documents")
-    print(f"Extracted {total_entities} entities")
-    print(f"Entity vectors saved to {os.path.join(args.data_dir, 'entity_vectors.npy')}")
-
 if __name__ == "__main__":
     main()

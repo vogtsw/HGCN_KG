@@ -34,7 +34,8 @@ unzip exaapd.zip -d data/exaapd/
 
 # 或者使用curl
 curl -L https://github.com/YOUR_USERNAME/exaapd-dataset/releases/download/v1.0/exaapd.zip -o exaapd.zip
-unzip exaapd.zip -d data/exaapd/
+unzip exaapd.zip -d data/exaapd/D:\HGCN_backup\models\wiki2vec\enwiki_20180420_300d.pkl -> D:\HGCN\HGCN-master\models\wiki2vec\
+D:\HGCN_backup\checkpoints\entity_enhanced\best_model.pt -> D:\HGCN\HGCN-master\checkpoints\entity_enhanced\
 ```
 
 ### 2. 下载预训练模型

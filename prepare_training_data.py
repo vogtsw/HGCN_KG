@@ -20,6 +20,53 @@ def load_entities_and_vectors(entity_file: str, vector_file: str) -> tuple:
     vectors = np.load(vector_file, allow_pickle=True)
     return entities, vectors
 
+def load_json_data(file_path: str) -> List[Dict]:
+    """加载JSON格式的数据文件
+    
+    Args:
+        file_path: JSON文件路径
+        
+    Returns:
+        data: 数据列表
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+        # 找到第一个JSON对象的开始
+        start_idx = content.find('{')
+        if start_idx == -1:
+            raise ValueError(f"No JSON content found in {file_path}")
+        content = content[start_idx:]
+        
+        # 尝试解析单个JSON对象
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict):
+                return [data]
+            elif isinstance(data, list):
+                return data
+        except json.JSONDecodeError:
+            # 如果解析失败，尝试提取所有JSON对象
+            data = []
+            current_pos = 0
+            while True:
+                try:
+                    obj_start = content.find('{', current_pos)
+                    if obj_start == -1:
+                        break
+                    
+                    decoder = json.JSONDecoder()
+                    obj, end = decoder.raw_decode(content[obj_start:])
+                    data.append(obj)
+                    current_pos = obj_start + end
+                except json.JSONDecodeError:
+                    if current_pos >= len(content):
+                        break
+                    current_pos += 1
+            
+            if not data:
+                raise ValueError(f"No valid JSON objects found in {file_path}")
+            return data
+
 def process_document(doc: Dict, doc_entities: List[Dict]) -> Dict:
     """处理单个文档
     
@@ -64,8 +111,7 @@ def prepare_dataset(input_dir: str, output_dir: str):
     
     # 处理训练集
     print("Processing training set...")
-    with open(os.path.join(input_dir, "train.json"), "r", encoding="utf-8") as f:
-        train_data = json.load(f)
+    train_data = load_json_data(os.path.join(input_dir, "exAAPD_train.json"))
     
     processed_train = []
     for i, doc in enumerate(tqdm(train_data)):
@@ -75,23 +121,9 @@ def prepare_dataset(input_dir: str, output_dir: str):
     with open(os.path.join(output_dir, "train.json"), "w", encoding="utf-8") as f:
         json.dump(processed_train, f, indent=2, ensure_ascii=False)
     
-    # 处理验证集
-    print("Processing dev set...")
-    with open(os.path.join(input_dir, "dev.json"), "r", encoding="utf-8") as f:
-        dev_data = json.load(f)
-    
-    processed_dev = []
-    for doc in tqdm(dev_data):
-        processed_doc = process_document(doc, [])  # 验证集暂时不添加实体
-        processed_dev.append(processed_doc)
-    
-    with open(os.path.join(output_dir, "dev.json"), "w", encoding="utf-8") as f:
-        json.dump(processed_dev, f, indent=2, ensure_ascii=False)
-    
     # 处理测试集
     print("Processing test set...")
-    with open(os.path.join(input_dir, "test.json"), "r", encoding="utf-8") as f:
-        test_data = json.load(f)
+    test_data = load_json_data(os.path.join(input_dir, "exAAPD_test.json"))
     
     processed_test = []
     for doc in tqdm(test_data):
@@ -99,6 +131,11 @@ def prepare_dataset(input_dir: str, output_dir: str):
         processed_test.append(processed_doc)
     
     with open(os.path.join(output_dir, "test.json"), "w", encoding="utf-8") as f:
+        json.dump(processed_test, f, indent=2, ensure_ascii=False)
+    
+    # 处理验证集（使用测试集）
+    print("Processing dev set...")
+    with open(os.path.join(output_dir, "dev.json"), "w", encoding="utf-8") as f:
         json.dump(processed_test, f, indent=2, ensure_ascii=False)
     
     # 复制实体向量
