@@ -41,14 +41,22 @@ import torch.nn as nn
 from tqdm import tqdm, trange
 from common.evaluators.bert_evaluator import BertEvaluator
 from common.trainers.bert_trainer import BertTrainer
-from transformers import WarmupLinearSchedule
+from transformers import get_linear_schedule_with_warmup
 from transformers.modeling_bert import BertConfig
 from transformers.tokenization_bert import BertTokenizer
 from transformers.optimization import AdamW
 from args import get_args
 from pytorch_pretrained_bert import BertModel
-from datasets.bert_processors.aapd_processor import exAAPDProcessor_has_structure,exPFDProcessor_has_structure,exLitCovidProcessor_has_structure,exMeSHProcessor_has_structure,
-                                                    exAAPDProcessor_no_structure,exPFDProcessor_no_structure,exLitCovidProcessor_no_structure,exMeSHProcessor_no_structure
+from datasets.bert_processors.aapd_processor import (
+    exAAPDProcessor_has_structure,
+    exPFDProcessor_has_structure,
+    exLitCovidProcessor_has_structure,
+    exMeSHProcessor_has_structure,
+    exAAPDProcessor_no_structure,
+    exPFDProcessor_no_structure,
+    exLitCovidProcessor_no_structure,
+    exMeSHProcessor_no_structure
+)
 from common.constants import *
 import copy
 
@@ -81,6 +89,38 @@ class customizedModule(nn.Module):
 
         return cl
 
+class DecoupledGraphPooling(nn.Module):
+    def __init__(self, input_dim, hidden_dim, dropout):
+        super(DecoupledGraphPooling, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        
+        # 定义图卷积层
+        self.graph_conv = nn.Linear(input_dim, hidden_dim)
+        # 定义注意力层
+        self.attention = nn.Linear(hidden_dim, 1)
+        
+    def forward(self, x, pooled_feature, section_mask, sentence_mask):
+        # 图卷积
+        x = self.graph_conv(x)
+        x = F.relu(x)
+        x = F.dropout(x, self.dropout, training=self.training)
+        
+        # 计算注意力分数
+        attention_scores = self.attention(x)
+        attention_scores = attention_scores.masked_fill(section_mask == 0, -1e9)
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        
+        # 应用注意力
+        attended = torch.matmul(attention_weights.transpose(-1, -2), x)
+        
+        # 更新mask
+        new_section_mask = (section_mask.sum(dim=-1) > 0).float()
+        new_sentence_mask = (sentence_mask.sum(dim=-1) > 0).float()
+        
+        return new_section_mask, new_sentence_mask, x, attended
+
 class ClassifyModel(customizedModule):
     def __init__(self, pretrained_model_name_or_path, args, device, is_lock=False):
         super(ClassifyModel, self).__init__()
@@ -90,7 +130,13 @@ class ClassifyModel(customizedModule):
         self.DGP.append(DecoupledGraphPooling(508, 768, 0.1))
         self.DGP.append(DecoupledGraphPooling(254, 768, 0.1))
         self.DGP.append(DecoupledGraphPooling(127, 768, 0.1))
-        self.classifier = nn.Linear(768, self.args.num_labels)
+        
+        # 添加KG向量处理层
+        self.kg_projection = nn.Linear(300, 768)  # 将300维KG向量投影到768维
+        self.kg_attention = nn.MultiheadAttention(768, num_heads=8)  # 注意力机制融合KG信息
+        
+        # 修改分类器输入维度，增加KG信息
+        self.classifier = nn.Linear(768 * 2, self.args.num_labels)  # 768*2是因为要拼接文本和KG特征
         self.zero = torch.zeros((254, 254)).to(device)
         if is_lock:
             for name, param in self.bert.named_parameters():
@@ -99,15 +145,30 @@ class ClassifyModel(customizedModule):
                 else:
                     param.requires_grad_(False)
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, sentence_mask=None, label=None, ):
-        all_token_feature, pooled_feature = self.bert(input_ids, token_type_ids, attention_mask,output_all_encoded_layers=False)
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, sentence_mask=None, label=None, entity_vectors=None):
+        # 获取BERT特征
+        all_token_feature, pooled_feature = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
+        
+        # 处理KG向量
+        if entity_vectors is not None:
+            # 将KG向量投影到与BERT相同的维度
+            kg_features = self.kg_projection(entity_vectors)  # [batch, entity_num, 768]
+            
+            # 使用注意力机制融合KG信息
+            kg_features = kg_features.transpose(0, 1)  # [entity_num, batch, 768]
+            pooled_feature = pooled_feature.unsqueeze(0)  # [1, batch, 768]
+            kg_enhanced, _ = self.kg_attention(pooled_feature, kg_features, kg_features)
+            kg_enhanced = kg_enhanced.squeeze(0)  # [batch, 768]
+        else:
+            kg_enhanced = torch.zeros_like(pooled_feature)
 
-        token_feature = all_token_feature[:, 1:-1, :]  # 获取段中所有单词的特征
-        token_feature = torch.reshape(token_feature,(-1, 7 * (self.args.max_seq_length - 2), 768))  # batch * word num * feature dim
-        # ******************************************************************************************************************************************************
+        # 原有的文本处理逻辑
+        token_feature = all_token_feature[:, 1:-1, :]
+        token_feature = torch.reshape(token_feature, (-1, 7 * (self.args.max_seq_length - 2), 768))
+        
         # 生成mask
-        h_mask = sentence_mask.unsqueeze(-1).expand(self.args.train_batch_size, 7, self.args.max_seq_length - 2,self.args.max_seq_length - 2)
-        v_mask = sentence_mask.unsqueeze(-2).expand(self.args.train_batch_size, 7, self.args.max_seq_length - 2,self.args.max_seq_length - 2)
+        h_mask = sentence_mask.unsqueeze(-1).expand(self.args.train_batch_size, 7, self.args.max_seq_length - 2, self.args.max_seq_length - 2)
+        v_mask = sentence_mask.unsqueeze(-2).expand(self.args.train_batch_size, 7, self.args.max_seq_length - 2, self.args.max_seq_length - 2)
         sentence_mask_full = torch.stack([torch.cat((torch.cat((i[0, :], self.zero, self.zero, self.zero, self.zero, self.zero, self.zero), 0),
                                                      torch.cat((self.zero, i[1, :], self.zero, self.zero, self.zero, self.zero, self.zero), 0),
                                                      torch.cat((self.zero, self.zero, i[2, :], self.zero, self.zero, self.zero, self.zero), 0),
@@ -115,7 +176,8 @@ class ClassifyModel(customizedModule):
                                                      torch.cat((self.zero, self.zero, self.zero, self.zero, i[4, :], self.zero, self.zero), 0),
                                                      torch.cat((self.zero, self.zero, self.zero, self.zero, self.zero, i[5, :], self.zero), 0),
                                                      torch.cat((self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, i[6, :]), 0)), 1) for i in (h_mask == v_mask)])
-        attention_mask_1 = torch.tensor(attention_mask.view(-1, 7, self.args.max_seq_length).unsqueeze(-1),dtype=torch.float)
+        
+        attention_mask_1 = torch.tensor(attention_mask.view(-1, 7, self.args.max_seq_length).unsqueeze(-1), dtype=torch.float)
         attention_mask_2 = torch.matmul(attention_mask_1, attention_mask_1.transpose(2, 3))[:, :, 1:-1, 1:-1]
         section_mask_full = torch.stack([torch.cat((torch.cat((i[0, :], self.zero, self.zero, self.zero, self.zero, self.zero, self.zero), 0),
                                                      torch.cat((self.zero, i[1, :], self.zero, self.zero, self.zero, self.zero, self.zero), 0),
@@ -124,29 +186,36 @@ class ClassifyModel(customizedModule):
                                                      torch.cat((self.zero, self.zero, self.zero, self.zero, i[4, :], self.zero, self.zero), 0),
                                                      torch.cat((self.zero, self.zero, self.zero, self.zero, self.zero, i[5, :], self.zero), 0),
                                                      torch.cat((self.zero, self.zero, self.zero, self.zero, self.zero, self.zero, i[6, :]), 0)), 1) for i in attention_mask_2])
-        # *************************************************************************************************************************************************
-        # 解耦图池化模块*******
-        section_mask, sentence_mask, new_att1, new_sec_fea1 = self.DGP[0](token_feature,pooled_feature.view(-1, 7, 768),section_mask_full, sentence_mask_full)
-        section_mask, sentence_mask, new_att2, new_sec_fea2 = self.DGP[1](new_att1, new_sec_fea1, section_mask,sentence_mask)
+        
+        # 解耦图池化模块
+        section_mask, sentence_mask, new_att1, new_sec_fea1 = self.DGP[0](token_feature, pooled_feature.view(-1, 7, 768), section_mask_full, sentence_mask_full)
+        section_mask, sentence_mask, new_att2, new_sec_fea2 = self.DGP[1](new_att1, new_sec_fea1, section_mask, sentence_mask)
 
-        u = torch.max(torch.cat([torch.max(new_att1, dim=1)[0].unsqueeze(1),
-                                 torch.max(new_att2, dim=1)[0].unsqueeze(1),
-                                 torch.max(new_sec_fea2, dim=1)[0].unsqueeze(1)], dim=1), dim=1)[0]
-
-        logits = self.classifier(u)
+        # 融合文本和KG特征
+        text_features = torch.max(torch.cat([torch.max(new_att1, dim=1)[0].unsqueeze(1),
+                                           torch.max(new_att2, dim=1)[0].unsqueeze(1),
+                                           torch.max(new_sec_fea2, dim=1)[0].unsqueeze(1)], dim=1), dim=1)[0]
+        
+        # 拼接文本和KG特征
+        fused_features = torch.cat([text_features, kg_enhanced], dim=-1)
+        
+        # 分类
+        logits = self.classifier(fused_features)
         return logits
 
 def main():
     #Set default configuration in args.py
     args = get_args()
-    dataset_map = {'exAAPD_hs': exAAPDProcessor_has_structure,
-                   'exAAPD_ns': exAAPDProcessor_no_structure
-                   'exPFD_hs': exPFDProcessor_has_structure,
-                   'exPFD_ns': exPFDProcessor_no_structure
-                   'exLitCovid_hs': exLitCovidProcessor_has_structure,
-                   'exLitCovid_ns': exLitCovidProcessor_no_structure
-                   'exMeSH_hs': exMeSHProcessor_has_structure,
-                   'exMeSH_ns': exMeSHProcessor_no_structure}
+    dataset_map = {
+        'exAAPD_hs': exAAPDProcessor_has_structure,
+        'exAAPD_ns': exAAPDProcessor_no_structure,
+        'exPFD_hs': exPFDProcessor_has_structure,
+        'exPFD_ns': exPFDProcessor_no_structure,
+        'exLitCovid_hs': exLitCovidProcessor_has_structure,
+        'exLitCovid_ns': exLitCovidProcessor_no_structure,
+        'exMeSH_hs': exMeSHProcessor_has_structure,
+        'exMeSH_ns': exMeSHProcessor_no_structure
+    }
 
     output_modes = {"rte": "classification"}
 
@@ -236,7 +305,7 @@ def main():
         else:
             optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr, weight_decay=0.01, correct_bias=False)
             #Transformer version == 2.1.1
-            scheduler = WarmupLinearSchedule(optimizer, t_total=num_train_optimization_steps,
+            scheduler = get_linear_schedule_with_warmup(optimizer, t_total=num_train_optimization_steps,
                                              warmup_steps=args.warmup_proportion * num_train_optimization_steps)
             # Transformer version == 3.1.0/4.6.0
             # scheduler = get_linear_schedule_with_warmup(optimizer, num_training_steps=num_train_optimization_steps,

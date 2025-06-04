@@ -45,7 +45,7 @@ def load_data(args):
     
     # 加载数据处理器
     processor = EntityEnhancedProcessor(
-        entity_vector_path=os.path.join(args.data_dir, "entity_vectors.npy")
+        entity_vector_path=args.entity_vector_path
     )
     
     # 加载数据
@@ -66,6 +66,7 @@ def load_data(args):
     return train_loader, dev_loader, test_loader
 
 def train(args):
+    """训练模型"""
     # 设置随机种子
     set_seed(args.seed)
     
@@ -73,68 +74,60 @@ def train(args):
     train_loader, dev_loader, test_loader = load_data(args)
     
     # 创建模型
-    config = {
-        'encoder': None,  # 需要根据实际情况设置
-        'hidden_dim': args.hidden_dim,
-        'dropout': args.dropout,
-        'target_size': args.num_labels,
-        'model_name': args.model
-    }
+    model = EntityEnhancedHGCN(
+        bert_model=args.model,
+        num_labels=args.num_labels,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout
+    )
     
-    # 初始化BERT编码器
-    config['encoder'] = BertModel.from_pretrained(args.model)
-    
-    # 创建模型
-    model = EntityEnhancedHGCN(config)
-    
+    # 将模型移动到GPU（如果可用）
     if torch.cuda.is_available():
         model = model.cuda()
     
-    # 创建优化器
+    # 定义优化器
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     
-    # 训练循环
+    # 训练模型
     best_dev_acc = 0
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0
-        
         for batch in train_loader:
             # 将数据移动到GPU（如果可用）
             if torch.cuda.is_available():
                 batch = tuple(t.cuda() for t in batch)
             
-            input_ids, attention_mask, entity_vectors, labels = batch
+            input_ids, attention_mask, entity_vectors, batch_labels = batch
             
-            optimizer.zero_grad()
+            # 前向传播
             logits = model(input_ids=input_ids, 
                          attention_mask=attention_mask, 
                          entity_vectors=entity_vectors)
             
-            loss = nn.CrossEntropyLoss()(logits, labels)
+            # 计算损失
+            loss = nn.CrossEntropyLoss()(logits, batch_labels)
+            total_loss += loss.item()
+            
+            # 反向传播
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-            total_loss += loss.item()
         
-        # 评估
-        train_loss, train_acc = evaluate_split(model, train_loader, "train")
+        # 评估模型
         dev_loss, dev_acc = evaluate_split(model, dev_loader, "dev")
-        test_loss, test_acc = evaluate_split(model, test_loader, "test")
-        
-        print(f"Epoch {epoch + 1}/{args.epochs}")
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        print(f"Dev Loss: {dev_loss:.4f}, Dev Acc: {dev_acc:.4f}")
-        print(f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}, Train Loss: {total_loss/len(train_loader):.4f}, Dev Loss: {dev_loss:.4f}, Dev Acc: {dev_acc:.4f}")
         
         # 保存最佳模型
         if dev_acc > best_dev_acc:
             best_dev_acc = dev_acc
             torch.save(model.state_dict(), os.path.join(args.save_path, "best_model.pt"))
-
-def main():
-    args = get_args()
-    train(args)
+    
+    # 加载最佳模型并评估
+    model.load_state_dict(torch.load(os.path.join(args.save_path, "best_model.pt")))
+    test_loss, test_acc = evaluate_split(model, test_loader, "test")
+    print(f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
 
 if __name__ == "__main__":
-    main()
+    args = get_args()
+    train(args)

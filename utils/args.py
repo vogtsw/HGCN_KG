@@ -11,6 +11,8 @@ def get_args():
                         help="预训练模型名称")
     parser.add_argument("--max_seq_length", type=int, default=128,
                         help="最大序列长度")
+    parser.add_argument("--entity_vector_path", type=str, required=True,
+                        help="实体向量文件路径")
     
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=32,

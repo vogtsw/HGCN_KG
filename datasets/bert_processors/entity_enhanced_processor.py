@@ -11,13 +11,22 @@ class EntityEnhancedProcessor(BertProcessor):
 
     def __init__(self, entity_vector_path: str):
         super().__init__()
-        self.entity_vectors = np.zeros((1, 300))  # 使用固定的300维向量
+        self.entity_vectors = None
         if os.path.exists(entity_vector_path):
             try:
-                self.entity_vectors = np.load(entity_vector_path, allow_pickle=True)
+                if entity_vector_path.endswith('.npy'):
+                    self.entity_vectors = np.load(entity_vector_path, allow_pickle=True)
+                elif entity_vector_path.endswith('.json'):
+                    with open(entity_vector_path, 'r', encoding='utf-8') as f:
+                        self.entity_vectors = json.load(f)
+                        self.entity_vectors = [np.array(vecs) for vecs in self.entity_vectors]
+                else:
+                    print(f"Unsupported entity vector file format: {entity_vector_path}")
             except Exception as e:
                 print(f"Warning: Could not load entity vectors from {entity_vector_path}: {e}")
                 print("Using zero vectors instead.")
+        if self.entity_vectors is None:
+            self.entity_vectors = []
         
     def get_train_examples(self, data_dir: str) -> List[InputExample]:
         """获取训练样本
@@ -29,7 +38,7 @@ class EntityEnhancedProcessor(BertProcessor):
             examples: 训练样本列表
         """
         return self._create_examples(
-            self._read_json(os.path.join(data_dir, "train.json")),
+            self._read_json(os.path.join(data_dir, "exAAPD_train.json")),
             "train"
         )
 
@@ -43,7 +52,7 @@ class EntityEnhancedProcessor(BertProcessor):
             examples: 验证样本列表
         """
         return self._create_examples(
-            self._read_json(os.path.join(data_dir, "dev.json")),
+            self._read_json(os.path.join(data_dir, "exAAPD_dev.json")),
             "dev"
         )
 
@@ -57,51 +66,47 @@ class EntityEnhancedProcessor(BertProcessor):
             examples: 测试样本列表
         """
         return self._create_examples(
-            self._read_json(os.path.join(data_dir, "test.json")),
+            self._read_json(os.path.join(data_dir, "exAAPD_test.json")),
             "test"
         )
 
     def _read_json(self, input_file: str) -> List[Dict]:
-        """读取JSON文件
-
-        Args:
-            input_file: 输入文件路径
-
-        Returns:
-            data: 数据列表
-        """
+        """读取JSON文件，兼容每行一个json对象的格式"""
         with open(input_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                # 行式json
+                return [json.loads(line) for line in f if line.strip()]
 
-    def _create_examples(self, lines: List[Dict], set_type: str) -> List[InputExample]:
-        """创建样本
+    def _create_examples(self, data: List[Dict], set_type: str) -> List[InputExample]:
+        """创建输入样本
 
         Args:
-            lines: 数据列表
-            set_type: 数据集类型
+            data: 数据列表
+            set_type: 数据集类型(train/dev/test)
 
         Returns:
-            examples: 样本列表
+            examples: 输入样本列表
         """
         examples = []
-        for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, i)
-            text = line["text"]
-            label = line["label"]
+        for i, item in enumerate(data):
+            # 获取文本内容
+            text = item["title"] + " " + item["abstract"]
             
-            # 对于每个文档，我们暂时使用空的实体向量
-            # 在实际应用中，这里应该根据文本提取实体并获取对应的向量
-            entity_vectors = np.zeros((1, 300))  # 使用固定的300维向量
+            # 获取实体信息
+            entities = item.get("entities", [])
+            entity_vectors = item.get("entity_vectors", [])
             
-            examples.append(
-                InputExample(
-                    guid=guid,
-                    text_a=text,
-                    text_b=None,
-                    label=label,
-                    entity_vectors=entity_vectors
-                )
+            # 创建样本
+            example = InputExample(
+                guid=f"{set_type}-{i}",
+                text_a=text,
+                label=item.get("label", None),
+                entity_vectors=np.array(entity_vectors) if entity_vectors else None
             )
+            examples.append(example)
+            
         return examples
         
     def convert_examples_to_features(self, examples: List[InputExample], max_seq_length: int, tokenizer) -> List[Dict]:
