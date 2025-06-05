@@ -1,6 +1,6 @@
 # HGCN with KG Enhancement
 
-本项目基于HGCN（Heterogeneous Graph Convolutional Network）模型，结合知识图谱（KG）增强文本表示。主要流程包括：使用BERT-NER提取实体，用Wikipedia2Vec获取实体向量，将KG向量融合到训练数据，并修改HGCN模型以支持KG增强。
+本项目基于HGCN（Hierarchical Graph Convolutional Network）模型，结合知识图谱（KG）增强文本表示。主要流程包括：使用BERT-NER提取实体，用Wikipedia2Vec获取实体向量，将KG向量融合到训练数据，并修改HGCN模型以支持KG增强。
 
 ## 环境准备
 
